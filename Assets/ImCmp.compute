@@ -1,0 +1,339 @@
+﻿
+/*----------------------------------------------------------------------------------------------------------------------
+ * Matrix to transform from Adobe RGB color space to CIE XYZ
+ *--------------------------------------------------------------------------------------------------------------------*/
+static const float3 kRgbToXyz0 = float3(0.576700, 0.185556, 0.188212);
+static const float3 kRgbToXyz1 = float3(0.297361, 0.627355, 0.0752847);
+static const float3 kRgbToXyz2 = float3(0.0270328, 0.0706879, 0.991248);
+
+/* Inverted White Point under D65 Illuminant */
+static const float3 kXyzInvWhite = float3(1.0 / 0.9504700, 1.0 / 1.0000001, 1.0 / 1.0888300);
+
+/*----------------------------------------------------------------------------------------------------------------------
+ * Constants to covert from CIE XYZ color space to CIE LAB
+ *--------------------------------------------------------------------------------------------------------------------*/
+static const float kXyzToLabPow = 0.33333333;
+
+/* (1/3) * delta^-2 = (1/3)*(29/6)^ = 7.787(037)*/
+static const float kXyzToLabMul = 7.78703704;
+
+/* (16/116) = 0.13793103448275862068965517241379 */
+static const float kXyzToLabAdd = 0.13793103;
+
+/* delta^3 = (6/29)^3 = (216 / 24389) = 0.00885645167903563081717167575546*/
+static const float kXyzToLabEps = 0.00885645;
+
+float3 ComputeLuminanceAndEDelta(float3 v0, float3 v1)
+{
+    float3 xyz0, xyz1;
+    xyz0.x = dot(kRgbToXyz0, v0);
+    xyz1.x = dot(kRgbToXyz0, v1);
+
+    xyz0.y = dot(kRgbToXyz1, v0);
+    xyz1.y = dot(kRgbToXyz1, v1);
+
+    xyz0.z = dot(kRgbToXyz2, v0);
+    xyz1.z = dot(kRgbToXyz2, v1);
+
+    xyz0 *= kXyzInvWhite;
+    xyz1 *= kXyzInvWhite;
+
+    float3 lab0_case0 = pow(max(xyz0, 0.000001), kXyzToLabPow);
+    float3 lab1_case0 = pow(max(xyz1, 0.000001), kXyzToLabPow);
+
+    float3 lab0_case1 = xyz0 * kXyzToLabMul + kXyzToLabAdd;
+    float3 lab1_case1 = xyz1 * kXyzToLabMul + kXyzToLabAdd;
+
+    float3 lab0 = (xyz0 > kXyzToLabEps) ? lab0_case0 : lab0_case1;
+    float3 lab1 = (xyz1 > kXyzToLabEps) ? lab1_case0 : lab1_case1;
+
+    float deltaA = (lab0.x - lab0.y) - (lab1.x - lab1.y);
+    float deltaB = (lab0.y - lab0.z) - (lab1.y - lab1.z);
+
+    float delta = (deltaA * deltaA * 25.0) + (deltaB * deltaB * 4.0);
+
+    return float3(xyz0.y, xyz1.y, delta);
+}
+
+uint PackFloat2ToUint(float2 x)
+{
+    return (f32tof16(x.x) << 16) | (f32tof16(x.y) & 0xffff);
+}
+
+float2 UnpackFloat2FromUint(uint x)
+{
+    return float2(f16tof32(x >> 16), f16tof32(x & 0xffff));
+}
+
+
+/*----------------------------------------------------------------------------------------------------------------------
+ * Used Resources
+ *--------------------------------------------------------------------------------------------------------------------*/
+Texture2D<float3> ImageA : register(t0);
+Texture2D<float3> ImageB : register(t1);
+
+Texture2DArray<float> LumBlurredABIn : register(t0);
+Texture2D<float> EDeltaIn : register(t1);
+
+RWTexture2DArray<float> LumBlurredABOut : register (u0);
+RWTexture2D<float> EDeltaOut : register(u1);
+
+RWTexture2D<float2> Result : register(u0);
+
+SamplerState PointClampSampler;
+
+cbuffer Constants : register(b0)
+{
+    float2  cbTextureSizeInverted;
+    float   cbCpdConsts[6];
+    float   cbFrqConsts[6];
+    float   cbColorFactor;
+
+    uint2   cbTextureSizeUint;
+    uint    cbAdaptationLevel;
+    uint    cbBlurSliceId;
+};
+
+
+/*----------------------------------------------------------------------------------------------------------------------
+ * Shader for computing luminance and LAB Delta E 76
+ *--------------------------------------------------------------------------------------------------------------------*/
+[numthreads(8,8,1)]
+void CSExtractLumAB(uint3 id : SV_DispatchThreadID)
+{
+    const float3 v0 = pow(ImageA[id.xy], 2.2);
+    const float3 v1 = pow(ImageB[id.xy], 2.2);
+
+    float3 result = ComputeLuminanceAndEDelta(v0, v1);
+
+    LumBlurredABOut[uint3(id.xy, 0)] = asfloat(PackFloat2ToUint(result.xy));
+
+    EDeltaOut[id.xy] = result.z;
+}
+
+/*----------------------------------------------------------------------------------------------------------------------
+ * Simple single-pass blur for computing luminance pyramid
+ *--------------------------------------------------------------------------------------------------------------------*/
+#define BLUR_KERNEL_DIM (8)
+#define BLUR_BORDER_DIM (2)
+#define BLUR_WINDOW_DIM (8 + 2 * BLUR_BORDER_DIM)
+
+#define BLUR_KERNEL_SIZE (BLUR_KERNEL_DIM * BLUR_KERNEL_DIM)
+#define BLUR_WINDOW_SIZE (BLUR_WINDOW_DIM * BLUR_WINDOW_DIM)
+
+groupshared uint LdsStorage1[BLUR_WINDOW_SIZE];
+
+groupshared uint LdsStorage2[BLUR_KERNEL_DIM * BLUR_WINDOW_DIM];
+
+float2 UnpackAndBlur(uint Sample0, uint Sample1, uint Sample2, uint Sample3, uint Sample4)
+{
+    const float2 v0 = UnpackFloat2FromUint(Sample0) + UnpackFloat2FromUint(Sample4);
+    const float2 v1 = UnpackFloat2FromUint(Sample1) + UnpackFloat2FromUint(Sample3);
+    const float2 v2 = UnpackFloat2FromUint(Sample2);
+
+    return v0 * 0.053991 + v1 * 0.241971 + v2 * 0.398942;
+}
+
+[numthreads(BLUR_KERNEL_DIM, BLUR_KERNEL_DIM, 1)]
+void CSBlur (uint FlatId : SV_GroupIndex, uint2 LocalId : SV_GroupThreadID, uint2 GroupId : SV_GroupID)
+{
+    uint2 GroupOffset = GroupId << 3;
+
+    uint i;
+    /*
+        Pre-load all texels to the LDS. Spread load across all threads.
+        In case of 5x5 blur kernel and 8x8 thread group we need to sample 12x12 area.
+        Totally we need to sample 144 texels by 64 threads. So, each thread will load at least 2 texels
+        But some of them will load 3 texels.
+        TODO : Test 16x16 thread group with 20x20 window what gives 2 texels per thread in worst case
+    */
+    for (i = FlatId; i < BLUR_WINDOW_SIZE; i += BLUR_KERNEL_SIZE)
+    {
+        const uint ix = i % BLUR_WINDOW_DIM;
+        const uint iy = i / BLUR_WINDOW_DIM;
+
+        uint2 Coord = GroupOffset + uint2(ix, iy);
+
+        /* Offset by -BLUR_BORDER_DIM texels and wrap */
+        Coord.x = (Coord.x < BLUR_BORDER_DIM) ? (BLUR_BORDER_DIM - Coord.x - 1) : Coord.x - BLUR_BORDER_DIM;
+        Coord.y = (Coord.y < BLUR_BORDER_DIM) ? (BLUR_BORDER_DIM - Coord.y - 1) : Coord.y - BLUR_BORDER_DIM;
+
+        if (Coord.x >= cbTextureSizeUint.x) Coord.x = (cbTextureSizeUint.x << 1) - 1 - Coord.x;
+        if (Coord.y >= cbTextureSizeUint.y) Coord.y = (cbTextureSizeUint.y << 1) - 1 - Coord.y;
+
+        const float SampledValue = LumBlurredABOut[uint3(Coord, cbBlurSliceId)];
+
+        LdsStorage1[i] = asuint(SampledValue);
+    }
+
+    GroupMemoryBarrierWithGroupSync();
+
+    /*
+        Blur horizontally
+    */
+    for (i = FlatId; i < (BLUR_WINDOW_DIM * BLUR_KERNEL_DIM); i += BLUR_KERNEL_SIZE)
+    {
+        const uint ix = i % BLUR_KERNEL_DIM;
+        const uint iy = i / BLUR_KERNEL_DIM;
+
+        const uint BaseOffset = iy * BLUR_WINDOW_DIM + ix;
+
+        const uint Sample0 = LdsStorage1[BaseOffset + 0];
+        const uint Sample1 = LdsStorage1[BaseOffset + 1];
+        const uint Sample2 = LdsStorage1[BaseOffset + 2];
+        const uint Sample3 = LdsStorage1[BaseOffset + 3];
+        const uint Sample4 = LdsStorage1[BaseOffset + 4];
+
+        LdsStorage2[i] = PackFloat2ToUint(UnpackAndBlur(Sample0, Sample1, Sample2, Sample3, Sample4));
+    }
+
+    GroupMemoryBarrierWithGroupSync();
+
+    /*
+        Blur vertically
+    */
+    const uint BaseOffset = LocalId.y * BLUR_KERNEL_DIM + LocalId.x;
+
+    const uint Sample0 = LdsStorage2[BaseOffset];
+    const uint Sample1 = LdsStorage2[BaseOffset + 1 * BLUR_KERNEL_DIM];
+    const uint Sample2 = LdsStorage2[BaseOffset + 2 * BLUR_KERNEL_DIM];
+    const uint Sample3 = LdsStorage2[BaseOffset + 3 * BLUR_KERNEL_DIM];
+    const uint Sample4 = LdsStorage2[BaseOffset + 4 * BLUR_KERNEL_DIM];
+
+    const float2 Luminance = UnpackAndBlur(Sample0, Sample1, Sample2, Sample3, Sample4);
+
+    LumBlurredABOut[uint3(GroupOffset + LocalId, cbBlurSliceId + 1)] = asfloat(PackFloat2ToUint(Luminance));
+}
+
+
+float tvi(float adapt)
+{
+    float log_a = log10(adapt);
+
+    float pow_arg0 = 0.405 * log_a + 1.60;
+    float pow_arg1 = 0.249 * log_a + 0.65;
+
+    float r = -2.86;
+
+    r = (log_a >= -3.94  ) ? pow(pow_arg0, 2.18) - 2.86 : r;
+    r = (log_a >= -1.44  ) ? log_a - 0.395 : r;
+    r = (log_a >= -0.0184) ? pow(pow_arg1, 2.70) - 0.72 : r;
+    r = (log_a >=  1.9   ) ? log_a - 1.255 : r;
+
+    return pow(10.0, r);
+}
+
+float ComputeThresholdFactor(float Contrast[6], float AdaptLuminance)
+{
+    float AdaptLuminanceInverted = rcp(AdaptLuminance);
+
+    float a = 440.0 * pow(1.0 + 0.7 * AdaptLuminanceInverted, -0.2);
+    float b = 0.3 * pow(1.0 + 100.0 * AdaptLuminanceInverted, 0.15);
+
+    float exp_b_cpd0 = exp(-b * cbCpdConsts[0]);
+    float exp_b_cpd1 = exp(-b * cbCpdConsts[1]);
+    float exp_b_cpd2 = exp(-b * cbCpdConsts[2]);
+    float exp_b_cpd3 = exp(-b * cbCpdConsts[3]);
+    float exp_b_cpd4 = exp(-b * cbCpdConsts[4]);
+    float exp_b_cpd5 = exp(-b * cbCpdConsts[5]);
+
+    float tmp0 = a * 1.001262398 * Contrast[0] * cbCpdConsts[0];
+    float tmp1 = a * 1.001262398 * Contrast[1] * cbCpdConsts[1];
+    float tmp2 = a * 1.001262398 * Contrast[2] * cbCpdConsts[2];
+    float tmp3 = a * 1.001262398 * Contrast[3] * cbCpdConsts[3];
+    float tmp4 = a * 1.001262398 * Contrast[4] * cbCpdConsts[4];
+    float tmp5 = a * 1.001262398 * Contrast[5] * cbCpdConsts[5];
+
+    float exp_b_cpd_tmp0 = exp_b_cpd0 * tmp0;
+    float exp_b_cpd_tmp1 = exp_b_cpd1 * tmp1;
+    float exp_b_cpd_tmp2 = exp_b_cpd2 * tmp2;
+    float exp_b_cpd_tmp3 = exp_b_cpd3 * tmp3;
+    float exp_b_cpd_tmp4 = exp_b_cpd4 * tmp4;
+    float exp_b_cpd_tmp5 = exp_b_cpd5 * tmp5;
+
+    float csf_mul_contrast_0 = (exp_b_cpd_tmp0 + 0.06 * tmp0) * exp_b_cpd_tmp0;
+    float csf_mul_contrast_1 = (exp_b_cpd_tmp1 + 0.06 * tmp1) * exp_b_cpd_tmp1;
+    float csf_mul_contrast_2 = (exp_b_cpd_tmp2 + 0.06 * tmp2) * exp_b_cpd_tmp2;
+    float csf_mul_contrast_3 = (exp_b_cpd_tmp3 + 0.06 * tmp3) * exp_b_cpd_tmp3;
+    float csf_mul_contrast_4 = (exp_b_cpd_tmp4 + 0.06 * tmp4) * exp_b_cpd_tmp4;
+    float csf_mul_contrast_5 = (exp_b_cpd_tmp5 + 0.06 * tmp5) * exp_b_cpd_tmp5;
+
+    float vmf_0 = sqrt(sqrt(1.0 + pow(csf_mul_contrast_0, 1.4)));
+    float vmf_1 = sqrt(sqrt(1.0 + pow(csf_mul_contrast_1, 1.4)));
+    float vmf_2 = sqrt(sqrt(1.0 + pow(csf_mul_contrast_2, 1.4)));
+    float vmf_3 = sqrt(sqrt(1.0 + pow(csf_mul_contrast_3, 1.4)));
+    float vmf_4 = sqrt(sqrt(1.0 + pow(csf_mul_contrast_4, 1.4)));
+    float vmf_5 = sqrt(sqrt(1.0 + pow(csf_mul_contrast_5, 1.4)));
+
+    float SumFactor = 0.0;
+    SumFactor += vmf_0 * Contrast[0] * cbFrqConsts[0];
+    SumFactor += vmf_1 * Contrast[1] * cbFrqConsts[1];
+    SumFactor += vmf_2 * Contrast[2] * cbFrqConsts[2];
+    SumFactor += vmf_3 * Contrast[3] * cbFrqConsts[3];
+    SumFactor += vmf_4 * Contrast[4] * cbFrqConsts[4];
+    SumFactor += vmf_5 * Contrast[5] * cbFrqConsts[5];
+
+    float SumContrast = 0.0;
+    SumContrast += Contrast[0];
+    SumContrast += Contrast[1];
+    SumContrast += Contrast[2];
+    SumContrast += Contrast[3];
+    SumContrast += Contrast[4];
+    SumContrast += Contrast[5];
+
+    return clamp(SumFactor / max(0.00001, SumContrast), 1.0, 10.0);
+}
+
+/*----------------------------------------------------------------------------------------------------------------------
+ * Computes color difference metric
+ *--------------------------------------------------------------------------------------------------------------------*/
+[numthreads(8,8,1)]
+void CSMetric (uint3 id : SV_DispatchThreadID)
+{
+    const float2 Uv = (float2(id.xy) + float2(0.5, 0.5)) * cbTextureSizeInverted;
+
+    float LumA[8];
+    float LumB[8];
+
+    [unroll]
+    for (uint i = 0; i < 8; ++i)
+    {
+        float2 LumAB = UnpackFloat2FromUint(asuint(LumBlurredABIn.SampleLevel(PointClampSampler, float3(Uv, i), 0)));
+
+        LumA[i] = 100.0 * LumAB.x;
+        LumB[i] = 100.0 * LumAB.y;
+    }
+
+    float Contrast[6];
+
+    [unroll]
+    for (i = 0; i < 6; ++i)
+    {
+        const float Nomin = max(abs(LumA[i] - LumA[i + 1]), abs(LumB[i] - LumB[i + 1]));
+
+        const float Denom = max(0.00001, max(abs(LumA[i + 2]), abs(LumB[i + 2])));
+
+        Contrast[i] = Nomin / Denom;
+    }
+
+    float AdaptationLum = max(0.00001, (LumA[cbAdaptationLevel] + LumB[cbAdaptationLevel]) * 0.5);
+
+    float threshold = ComputeThresholdFactor(Contrast, AdaptationLum);
+
+    uint fail = abs(LumA[0] - LumB[0]) > threshold * tvi(AdaptationLum);
+
+    [branch]
+    if (fail == 0 && cbColorFactor > 0.0 && (AdaptationLum >= 10.0))
+    {
+        float delta_e = EDeltaIn.SampleLevel(PointClampSampler, Uv, 0);
+
+        fail = delta_e * cbColorFactor > threshold * 0.0001;
+    }
+
+    Result[id.xy] = (fail != 0) ? 1.0 : 0.0;
+}
+
+// Each #kernel tells which function to compile; you can have many kernels
+#pragma kernel CSExtractLumAB
+#pragma kernel CSBlur
+#pragma kernel CSMetric
